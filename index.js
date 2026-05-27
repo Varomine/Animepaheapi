@@ -147,15 +147,13 @@ app.get('/proxy', async (req, res) => {
   try {
     const { url, referer: customReferer } = req.query;
     if (!url) {
-      return res.status(400).json({
-        error: 'Query parameter "url" is required',
-        usage: 'GET /proxy?url=<m3u8-or-ts-url>&referer=<optional-referer>',
-        example: '/proxy?url=https://example.com/video.m3u8&referer=https://kwik.si/'
-      });
+      return res.status(400).json({ error: 'Query parameter "url" is required' });
     }
 
-    // Automatically resolve Kwik URLs
-    if (url.includes('kwik.cx/e/') || url.includes('kwik.si/e/') || url.match(/kwik\.[a-z]+\/e\//)) {
+    // --- [แก้ไขจุดบกพร่องสำคัญ]: เช็คก่อนว่าไม่ใช่ไฟล์วิดีโอตรงๆ ถึงจะยอมให้เข้ากระบวนการแกะเว็บ Kwik ---
+    const isVideoFile = url.includes('.ts') || url.includes('.m3u8') || url.includes('owocdn.top');
+    
+    if (!isVideoFile && (url.includes('kwik.cx/e/') || url.includes('kwik.si/e/') || url.match(/kwik\.[a-z]+\/e\//))) {
       try {
         const result = await pahe.resolveKwikWithNode(url);
         const redirectUrl = `/proxy?url=${encodeURIComponent(result.m3u8)}&referer=${encodeURIComponent(result.referer)}`;
@@ -167,36 +165,39 @@ app.get('/proxy', async (req, res) => {
     }
 
     const axios = require('axios');
+    const { pipeline } = require('stream');
     const urlObj = new URL(url);
     const referer = customReferer || `${urlObj.protocol}//${urlObj.host}/`;
 
-    // Fetch the content with proper headers
+    const forwardHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Referer': referer,
+      'Origin': referer.slice(0, -1),
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Connection': 'keep-alive'
+    };
+
+    if (req.headers.range) {
+      forwardHeaders['Range'] = req.headers.range;
+    }
+
+    const controller = new AbortController();
+    req.on('close', () => {
+      controller.abort();
+    });
+
     const response = await axios.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': referer,
-        'Origin': referer.slice(0, -1),
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'cross-site'
-      },
+      headers: forwardHeaders,
       responseType: 'stream',
-      timeout: 30000,
+      timeout: 15000,
       maxRedirects: 5,
-      validateStatus: function (status) {
-        return status >= 200 && status < 500;
-      }
+      signal: controller.signal,
+      validateStatus: (status) => status >= 200 && status < 500
     });
 
     if (response.status === 403) {
-      return res.status(403).json({
-        error: 'Access forbidden - CDN blocked the request',
-        url: url
-      });
+      return res.status(403).json({ error: 'Access forbidden - CDN blocked the request', url: url });
     }
 
     const contentType = response.headers['content-type'] ||
@@ -212,13 +213,10 @@ app.get('/proxy', async (req, res) => {
         const modified = content.split('\n').map(line => {
           const t = line.trim();
           if (t.startsWith('#')) {
-            // Rewrite URIs in tags like #EXT-X-KEY:METHOD=AES-128,URI="..."
             if (t.includes('URI="')) {
               return t.replace(/URI="([^"]+)"/, (match, uri) => {
                 let fullUrl = uri;
-                if (!uri.startsWith('http')) {
-                  fullUrl = baseUrl + uri;
-                }
+                if (!uri.startsWith('http')) fullUrl = baseUrl + uri;
                 return `URI="/proxy?url=${encodeURIComponent(fullUrl)}${refererParam}"`;
               });
             }
@@ -236,16 +234,26 @@ app.get('/proxy', async (req, res) => {
         res.send(modified);
       });
     } else {
+      // --- สำหรับไฟล์ย่อย .ts จะวิ่งมาทำงานตรงนี้ทันที ดึงข้อมูลตามเวลาช่วงที่กดข้ามอย่างรวดเร็ว ---
       res.setHeader('Content-Type', contentType);
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Accept-Ranges', 'bytes');
+      
       if (response.headers['content-length']) res.setHeader('Content-Length', response.headers['content-length']);
       if (response.headers['content-range']) res.setHeader('Content-Range', response.headers['content-range']);
-
+      
       res.status(response.status);
-      response.data.pipe(res);
+
+      pipeline(response.data, res, (err) => {
+        if (err && err.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+          console.error('Stream pipeline error:', err.message);
+        }
+      });
     }
   } catch (error) {
+    if (error.name === 'CanceledError' || error.code === 'ERR_CANCELED') {
+      return;
+    }
     if (error.response && error.response.status === 403) {
       return res.status(403).json({ error: 'Access forbidden - CDN blocked the request' });
     }
